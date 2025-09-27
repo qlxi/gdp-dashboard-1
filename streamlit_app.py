@@ -1,151 +1,156 @@
-import streamlit as st
-import pandas as pd
-import math
+#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.request
+import json
+import shutil
 from pathlib import Path
+from OpenSSL import crypto
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+# === Цвета ===
+GREEN = "\033[32m"
+RED = "\033[31m"
+CYAN = "\033[36m"
+NC = "\033[0m"
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+# === Константы ===
+SINGBOX_VERSION = "1.11.15"
+SINGBOX_TAR = f"sing-box-{SINGBOX_VERSION}-linux-amd64.tar.gz"
+SINGBOX_URL = f"https://github.com/SagerNet/sing-box/releases/download/v{SINGBOX_VERSION}/{SINGBOX_TAR}"
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+HOME_DIR = os.environ.get("HOME", "/home/container")
+SB_DIR = Path(HOME_DIR) / ".sb"
+CERT_DIR = SB_DIR / "cert"
+CERT_PATH = CERT_DIR / "cert.pem"
+KEY_PATH = CERT_DIR / "key.pem"
+SB_JSON_PATH = SB_DIR / "sb.json"
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+# === Твои данные (ЗАДАЙ ТУТ!) ===
+HOST = "172.210.53.225"       # адрес сервера
+UUID = "123e4567-e89b-12d3-a456-426614174000"  # UUID пользователя
+PORT = 8443                      # порт
+SNI = "time.android.com"        # SNI-домен
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+# === Утилиты логов ===
+def log(msg): print(f"{CYAN}[INFO]{NC} {msg}")
+def ok(msg):  print(f"{GREEN}[OK]{NC} {msg}")
+def err(msg): 
+    print(f"{RED}[ERR]{NC} {msg}", file=sys.stderr)
+    sys.exit(1)
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+# === Проверка зависимостей ===
+def install_deps():
+    log("Проверка зависимостей...")
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+    # Проверка pyOpenSSL
+    try:
+        import OpenSSL
+    except ImportError:
+        log("Установка pyOpenSSL...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "pyOpenSSL"])
+    ok("pyOpenSSL готов")
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+# === Генерация сертификата ===
+def generate_cert():
+    log(f"Генерация сертификата для {SNI}")
+    CERT_DIR.mkdir(parents=True, exist_ok=True)
 
-    return gdp_df
+    key = crypto.PKey()
+    key.generate_key(crypto.TYPE_RSA, 2048)
 
-gdp_df = get_gdp_data()
+    cert = crypto.X509()
+    cert.get_subject().CN = SNI
+    cert.set_serial_number(1)
+    cert.gmtime_adj_notBefore(0)
+    cert.gmtime_adj_notAfter(365*24*60*60)
+    cert.set_issuer(cert.get_subject())
+    cert.set_pubkey(key)
+    cert.sign(key, "sha256")
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+    with open(CERT_PATH, "wb") as f:
+        f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
+    with open(KEY_PATH, "wb") as f:
+        f.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, key))
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+    ok("Сертификат создан")
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+# === Скачивание sing-box ===
+def download_singbox():
+    sb_bin = SB_DIR / "sb"
+    if sb_bin.exists() and os.access(sb_bin, os.X_OK):
+        log("sing-box уже скачан")
+        return
 
-# Add some spacing
-''
-''
+    log("Скачивание sing-box...")
+    SB_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_tar = Path(tempfile.gettempdir()) / SINGBOX_TAR
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
+    urllib.request.urlretrieve(SINGBOX_URL, tmp_tar)
 
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
+    with tarfile.open(tmp_tar, "r:gz") as tar:
+        tar.extractall(path=tempfile.gettempdir())
 
-countries = gdp_df['Country Code'].unique()
+    bin_path = Path(tempfile.gettempdir()) / f"sing-box-{SINGBOX_VERSION}-linux-amd64/sing-box"
+    shutil.move(str(bin_path), str(sb_bin))   # исправлено os.rename -> shutil.move
+    os.chmod(sb_bin, 0o755)
+    tmp_tar.unlink()
+    ok("sing-box установлен")
 
-if not len(countries):
-    st.warning("Select at least one country")
+# === Генерация конфигурации ===
+def generate_config():
+    log("Создание конфигурации sb.json")
+    config = {
+        "inbounds": [
+            {
+                "type": "hysteria2",
+                "listen": "::",
+                "listen_port": PORT,
+                "users": [{"password": UUID}],
+                "tls": {
+                    "enabled": True,
+                    "server_name": SNI,
+                    "key_path": str(KEY_PATH),
+                    "certificate_path": str(CERT_PATH)
+                },
+                "masquerade": f"https://{SNI}"
+            }
+        ],
+        "outbounds": [
+            {"tag": "direct", "type": "direct"},
+            {"tag": "block", "type": "block"}
+        ]
+    }
+    SB_JSON_PATH.write_text(json.dumps(config, indent=2))
+    ok("Конфиг создан")
 
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
+# === Генерация ссылки ===
+def generate_url():
+    log("Генерация hysteria2-ссылки")
+    try:
+        org = subprocess.check_output(
+            ["curl", "-s", "ipinfo.io/org"], text=True
+        ).strip()
+        org = org.split(" ", 1)[1] if " " in org else "hy2"
+        org = org.replace(" ", "-").lower()
+    except Exception:
+        org = "hy2"
 
-''
-''
-''
+    url = f"hysteria2://{UUID}@{HOST}:{PORT}/?sni={SNI}&insecure=1#{org}"
+    print(f"\n{GREEN}{url}{NC}\n")
 
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
+# === Запуск sing-box ===
+def run_singbox():
+    log("Запуск sing-box...")
+    os.execv(str(SB_DIR / "sb"), [str(SB_DIR / "sb"), "run", "-c", str(SB_JSON_PATH)])
 
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+# === Выполнение ===
+if __name__ == "__main__":
+    install_deps()
+    generate_cert()
+    download_singbox()
+    generate_config()
+    generate_url()
+    run_singbox()
